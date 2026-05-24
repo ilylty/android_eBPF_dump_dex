@@ -39,7 +39,6 @@ func main() {
 		maxDump     = flag.Uint64("max-dump", 64*1024, "maximum bytes to read from each DEX memory region, 0 means full size")
 		packageName = flag.String("package", "", "optional Android package name filter")
 		scanHeaders = flag.Bool("scan", false, "scan target process memory for DEX header fields like the GG Lua script")
-		minScanSize = flag.Uint64("min-scan-size", 0, "minimum DEX file_size accepted by memory scan")
 	)
 	flag.Parse()
 
@@ -59,13 +58,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(*bpfObject, *libPath, *symbolName, *offset, *outDir, targetPid, *maxDump, *scanHeaders, *minScanSize); err != nil {
+	if err := run(*bpfObject, *libPath, *symbolName, *offset, *outDir, targetPid, *maxDump, *scanHeaders); err != nil {
 		fmt.Fprintf(os.Stderr, "[-] %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, targetPid uint32, maxDump uint64, scanHeaders bool, minScanSize uint64) error {
+func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, targetPid uint32, maxDump uint64, scanHeaders bool) error {
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
@@ -110,10 +109,9 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 
 	seen := make(map[string]struct{})
 	dumped := make(map[string]struct{})
-	checksums := make(map[string]struct{})
 	var dumpedMu sync.Mutex
 	if scanHeaders && targetPid != 0 {
-		go scanDexHeaders(outDir, targetPid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
+		go scanDexHeaders(outDir, targetPid, maxDump, dumped, &dumpedMu)
 	}
 
 	for {
@@ -143,9 +141,9 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 
 		comm := string(bytes.TrimRight(event.Comm[:], "\x00"))
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
-		go dumpDex(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumped, checksums, &dumpedMu)
+		go dumpDex(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumped, &dumpedMu)
 		if scanHeaders {
-			go scanDexHeaders(outDir, event.Pid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
+			go scanDexHeaders(outDir, event.Pid, maxDump, dumped, &dumpedMu)
 		}
 	}
 }
@@ -192,7 +190,7 @@ func attachDexOpen(ex *link.Executable, prog *ebpf.Program, symbolName string, o
 	return nil, "", fmt.Errorf("failed to attach DEX open uprobe: %w", lastErr)
 }
 
-func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64, source string, dumped map[string]struct{}, checksums map[string]struct{}, dumpedMu *sync.Mutex) {
+func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64, source string, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
 	if size < 0x70 || size > 512*1024*1024 {
 		fmt.Printf("[-] Skip invalid DEX size pid=%d base=0x%x size=%d source=%s\n", pid, base, size, source)
 		return
@@ -237,18 +235,6 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 	}
 	packageName := packageNameForPid(pid)
 	packageDir := filepath.Join(outDir, sanitizePathComponent(packageName))
-	checksumKey := ""
-	if len(buf) >= 0x24 {
-		checksumKey = fmt.Sprintf("%s:%08x:%d", packageName, binary.LittleEndian.Uint32(buf[8:12]), binary.LittleEndian.Uint32(buf[0x20:0x24]))
-		dumpedMu.Lock()
-		if _, ok := checksums[checksumKey]; ok {
-			dumpedMu.Unlock()
-			fmt.Printf("[*] Skip duplicate DEX checksum=%s pid=%d base=0x%x source=%s\n", checksumKey, pid, base, source)
-			return
-		}
-		checksums[checksumKey] = struct{}{}
-		dumpedMu.Unlock()
-	}
 	if err := os.MkdirAll(packageDir, 0755); err != nil {
 		fmt.Printf("[-] Failed to create output directory %s: %v\n", packageDir, err)
 		return
@@ -330,7 +316,7 @@ func normalizeDexHeader(buf []byte) bool {
 	return false
 }
 
-func scanDexHeaders(outDir string, pid uint32, maxDump uint64, minScanSize uint64, dumped map[string]struct{}, checksums map[string]struct{}, dumpedMu *sync.Mutex) {
+func scanDexHeaders(outDir string, pid uint32, maxDump uint64, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
 	ranges, err := readableRanges(pid)
 	if err != nil {
 		fmt.Printf("[-] Failed to read maps for pid=%d: %v\n", pid, err)
@@ -356,7 +342,7 @@ func scanDexHeaders(outDir string, pid uint32, maxDump uint64, minScanSize uint6
 			buf := make([]byte, end-pos)
 			n, err := memFile.ReadAt(buf, int64(pos))
 			if n > 0 {
-				scanChunk(outDir, pid, memFile, pos, buf[:n], pattern, maxDump, minScanSize, dumped, checksums, dumpedMu)
+				scanChunk(outDir, pid, memFile, pos, buf[:n], pattern, maxDump, dumped, dumpedMu)
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
 				break
@@ -369,7 +355,7 @@ func scanDexHeaders(outDir string, pid uint32, maxDump uint64, minScanSize uint6
 	}
 }
 
-func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, buf []byte, pattern []byte, maxDump uint64, minScanSize uint64, dumped map[string]struct{}, checksums map[string]struct{}, dumpedMu *sync.Mutex) {
+func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, buf []byte, pattern []byte, maxDump uint64, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
 	for off := 0; ; {
 		idx := bytes.Index(buf[off:], pattern)
 		if idx < 0 {
@@ -379,9 +365,9 @@ func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, bu
 		if hit >= 0x24 {
 			base := hit - 0x24
 			size, ok := readDexFileSize(memFile, base)
-			if ok && size >= minScanSize {
+			if ok {
 				fmt.Printf("[*] Scanned DEX pid=%d base=0x%x size=%d\n", pid, base, size)
-				dumpDex(outDir, pid, base, size, maxDump, "scan", dumped, checksums, dumpedMu)
+				dumpDex(outDir, pid, base, size, maxDump, "scan", dumped, dumpedMu)
 			}
 		}
 		off += idx + 1
