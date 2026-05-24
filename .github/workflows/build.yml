@@ -22,7 +22,8 @@ jobs:
 
       - name: Generate vmlinux.h
         run: |
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          BPFTOOL=$(find /usr/lib/linux-tools-* -type f -name bpftool | head -n 1)
+          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
       - name: Compile eBPF bytecode
         run: |
