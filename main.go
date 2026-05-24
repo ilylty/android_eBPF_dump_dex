@@ -111,10 +111,8 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 	seen := make(map[string]struct{})
 	dumped := make(map[string]struct{})
 	checksums := make(map[string]struct{})
-	scannedPids := make(map[uint32]struct{})
 	var dumpedMu sync.Mutex
 	if scanHeaders && targetPid != 0 {
-		scannedPids[targetPid] = struct{}{}
 		go scanDexHeaders(outDir, targetPid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
 	}
 
@@ -147,15 +145,7 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
 		go dumpDex(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumped, checksums, &dumpedMu)
 		if scanHeaders {
-			dumpedMu.Lock()
-			_, alreadyScanned := scannedPids[event.Pid]
-			if !alreadyScanned {
-				scannedPids[event.Pid] = struct{}{}
-			}
-			dumpedMu.Unlock()
-			if !alreadyScanned {
-				go scanDexHeaders(outDir, event.Pid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
-			}
+			go scanDexHeaders(outDir, event.Pid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
 		}
 	}
 }
