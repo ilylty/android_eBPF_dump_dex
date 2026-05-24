@@ -63,42 +63,31 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return fmt.Errorf("failed to remove memlock limit: %w", err)
+		fmt.Printf("[-] Failed to remove memlock limit, continuing: %v\n", err)
 	}
 
-	spec, err := ebpf.LoadCollectionSpec(bpfObject)
-	if err != nil {
-		return fmt.Errorf("failed to load collection spec: %w", err)
+	var objs struct {
+		UprobeDexOpen *ebpf.Program `ebpf:"uprobe_dex_open"`
+		Events        *ebpf.Map     `ebpf:"events"`
 	}
-
-	coll, err := ebpf.NewCollection(spec)
-	if err != nil {
-		return fmt.Errorf("failed to create eBPF collection: %w", err)
+	if err := loadObjects(bpfObject, &objs); err != nil {
+		return fmt.Errorf("failed to load eBPF object: %w", err)
 	}
-	defer coll.Close()
-
-	prog := coll.Programs["uprobe_dex_open"]
-	if prog == nil {
-		return errors.New("program uprobe_dex_open not found")
-	}
+	defer objs.UprobeDexOpen.Close()
+	defer objs.Events.Close()
 
 	up, err := link.OpenExecutable(libPath)
 	if err != nil {
 		return fmt.Errorf("failed to open %s: %w", libPath, err)
 	}
 
-	ln, symbol, err := attachDexFileCtor(up, prog)
+	ln, symbol, err := attachDexFileCtor(up, objs.UprobeDexOpen)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
 
-	eventsMap := coll.Maps["events"]
-	if eventsMap == nil {
-		return errors.New("perf event map events not found")
-	}
-
-	rd, err := perf.NewReader(eventsMap, os.Getpagesize())
+	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*8)
 	if err != nil {
 		return fmt.Errorf("failed to create perf event reader: %w", err)
 	}
@@ -142,6 +131,19 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
 		go dumpDex(outDir, event)
 	}
+}
+
+func loadObjects(path string, objs interface{}) error {
+	spec, err := ebpf.LoadCollectionSpec(path)
+	if err != nil {
+		return err
+	}
+	return spec.LoadAndAssign(objs, &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogLevel: ebpf.LogLevelInstruction,
+			LogSize:  1024 * 1024,
+		},
+	})
 }
 
 func attachDexFileCtor(ex *link.Executable, prog *ebpf.Program) (link.Link, string, error) {
