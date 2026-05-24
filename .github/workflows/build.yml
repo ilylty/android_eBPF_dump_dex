@@ -24,6 +24,7 @@ jobs:
         run: |
           clang -target bpf \
             -D__TARGET_ARCH_arm64 \
+            -I/usr/include/x86_64-linux-gnu \
             -O2 -g -c dex_dump.bpf.c -o dex_dump.bpf.o
 
       - name: Set up Go
