@@ -18,18 +18,12 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev build-essential linux-tools-common linux-tools-azure linux-cloud-tools-azure
-
-      - name: Generate vmlinux.h
-        run: |
-          BPFTOOL=$(find /usr/lib/linux-tools-* -type f -name bpftool | head -n 1)
-          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev build-essential
 
       - name: Compile eBPF bytecode
         run: |
           clang -target bpf \
             -D__TARGET_ARCH_arm64 \
-            -I. \
             -O2 -g -c dex_dump.bpf.c -o dex_dump.bpf.o
 
       - name: Set up Go
