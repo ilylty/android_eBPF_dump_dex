@@ -18,7 +18,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev build-essential linux-tools-common linux-tools-$(uname -r)
+          sudo apt-get install -y clang llvm libelf-dev build-essential linux-tools-common linux-tools-azure linux-cloud-tools-azure
 
       - name: Generate vmlinux.h
         run: |
