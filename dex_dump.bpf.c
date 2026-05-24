@@ -16,9 +16,10 @@ struct dex_event {
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
-} rb SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+} events SEC(".maps");
 
 SEC("uprobe/dex_file_open")
 int uprobe_dex_open(struct user_pt_regs *ctx)
@@ -31,17 +32,14 @@ int uprobe_dex_open(struct user_pt_regs *ctx)
         return 0;
     }
 
-    struct dex_event *e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-    if (!e) {
-        return 0;
-    }
+    struct dex_event e = {};
 
-    e->base = base;
-    e->size = size;
-    e->pid = pid;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    e.base = base;
+    e.size = size;
+    e.pid = pid;
+    bpf_get_current_comm(&e.comm, sizeof(e.comm));
 
-    bpf_ringbuf_submit(e, 0);
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
     return 0;
 }
 

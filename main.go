@@ -16,7 +16,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/perf"
 )
 
 type dexEvent struct {
@@ -88,14 +88,14 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 	}
 	defer ln.Close()
 
-	rbMap := coll.Maps["rb"]
-	if rbMap == nil {
-		return errors.New("ring buffer map rb not found")
+	eventsMap := coll.Maps["events"]
+	if eventsMap == nil {
+		return errors.New("perf event map events not found")
 	}
 
-	rd, err := ringbuf.NewReader(rbMap)
+	rd, err := perf.NewReader(eventsMap, os.Getpagesize())
 	if err != nil {
-		return fmt.Errorf("failed to create ringbuf reader: %w", err)
+		return fmt.Errorf("failed to create perf event reader: %w", err)
 	}
 	defer rd.Close()
 
@@ -111,10 +111,10 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 	for {
 		record, err := rd.Read()
 		if err != nil {
-			if errors.Is(err, ringbuf.ErrClosed) {
+			if errors.Is(err, perf.ErrClosed) {
 				return nil
 			}
-			return fmt.Errorf("failed to read ringbuf event: %w", err)
+			return fmt.Errorf("failed to read perf event: %w", err)
 		}
 
 		var event dexEvent
