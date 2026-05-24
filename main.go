@@ -32,6 +32,7 @@ func main() {
 		bpfObject   = flag.String("obj", "dex_dump.bpf.o", "path to compiled eBPF object")
 		libPath     = flag.String("libart", "/apex/com.android.art/lib64/libart.so", "path to target libart.so")
 		outDir      = flag.String("out", "/data/local/tmp", "directory for dumped DEX files")
+		maxDump     = flag.Uint64("max-dump", 64*1024, "maximum bytes to read from each DEX memory region, 0 means full size")
 		packageName = flag.String("package", "", "optional Android package name filter")
 	)
 	flag.Parse()
@@ -52,13 +53,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(*bpfObject, *libPath, *outDir, targetPid); err != nil {
+	if err := run(*bpfObject, *libPath, *outDir, targetPid, *maxDump); err != nil {
 		fmt.Fprintf(os.Stderr, "[-] %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(bpfObject, libPath, outDir string, targetPid uint32) error {
+func run(bpfObject, libPath, outDir string, targetPid uint32, maxDump uint64) error {
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
@@ -87,7 +88,7 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 	}
 	defer ln.Close()
 
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*8)
+	rd, err := perf.NewReader(objs.Events, os.Getpagesize())
 	if err != nil {
 		return fmt.Errorf("failed to create perf event reader: %w", err)
 	}
@@ -129,7 +130,7 @@ func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 
 		comm := string(bytes.TrimRight(event.Comm[:], "\x00"))
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
-		go dumpDex(outDir, event)
+		go dumpDex(outDir, event, maxDump)
 	}
 }
 
@@ -164,7 +165,7 @@ func attachDexFileCtor(ex *link.Executable, prog *ebpf.Program) (link.Link, stri
 	return nil, "", fmt.Errorf("failed to attach DexFile constructor uprobe: %w", lastErr)
 }
 
-func dumpDex(outDir string, event dexEvent) {
+func dumpDex(outDir string, event dexEvent, maxDump uint64) {
 	memPath := fmt.Sprintf("/proc/%d/mem", event.Pid)
 	memFile, err := os.Open(memPath)
 	if err != nil {
@@ -178,7 +179,12 @@ func dumpDex(outDir string, event dexEvent) {
 		return
 	}
 
-	buf := make([]byte, event.Size)
+	readSize := event.Size
+	if maxDump > 0 && readSize > maxDump {
+		readSize = maxDump
+	}
+
+	buf := make([]byte, readSize)
 	if _, err := io.ReadFull(memFile, buf); err != nil {
 		fmt.Printf("[-] Failed to read DEX memory for pid=%d base=0x%x: %v\n", event.Pid, event.Base, err)
 		return
@@ -189,7 +195,7 @@ func dumpDex(outDir string, event dexEvent) {
 		return
 	}
 
-	outPath := filepath.Join(outDir, fmt.Sprintf("dump_pid_%d_0x%x.dex", event.Pid, event.Base))
+	outPath := filepath.Join(outDir, fmt.Sprintf("dump_pid_%d_0x%x_%d.dex", event.Pid, event.Base, readSize))
 	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		fmt.Printf("[-] Failed to create %s: %v\n", outPath, err)
