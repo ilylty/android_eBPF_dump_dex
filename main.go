@@ -111,8 +111,10 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 	seen := make(map[string]struct{})
 	dumped := make(map[string]struct{})
 	checksums := make(map[string]struct{})
+	scannedPids := make(map[uint32]struct{})
 	var dumpedMu sync.Mutex
 	if scanHeaders && targetPid != 0 {
+		scannedPids[targetPid] = struct{}{}
 		go scanDexHeaders(outDir, targetPid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
 	}
 
@@ -145,7 +147,15 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
 		go dumpDex(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumped, checksums, &dumpedMu)
 		if scanHeaders {
-			go scanDexHeaders(outDir, event.Pid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
+			dumpedMu.Lock()
+			_, alreadyScanned := scannedPids[event.Pid]
+			if !alreadyScanned {
+				scannedPids[event.Pid] = struct{}{}
+			}
+			dumpedMu.Unlock()
+			if !alreadyScanned {
+				go scanDexHeaders(outDir, event.Pid, maxDump, minScanSize, dumped, checksums, &dumpedMu)
+			}
 		}
 	}
 }
@@ -235,9 +245,11 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 		fmt.Printf("[-] Skip non-DEX memory pid=%d base=0x%x source=%s\n", pid, base, source)
 		return
 	}
+	packageName := packageNameForPid(pid)
+	packageDir := filepath.Join(outDir, sanitizePathComponent(packageName))
 	checksumKey := ""
 	if len(buf) >= 0x24 {
-		checksumKey = fmt.Sprintf("%08x:%d", binary.LittleEndian.Uint32(buf[8:12]), binary.LittleEndian.Uint32(buf[0x20:0x24]))
+		checksumKey = fmt.Sprintf("%s:%08x:%d", packageName, binary.LittleEndian.Uint32(buf[8:12]), binary.LittleEndian.Uint32(buf[0x20:0x24]))
 		dumpedMu.Lock()
 		if _, ok := checksums[checksumKey]; ok {
 			dumpedMu.Unlock()
@@ -247,8 +259,6 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 		checksums[checksumKey] = struct{}{}
 		dumpedMu.Unlock()
 	}
-
-	packageDir := outputDirForPid(outDir, pid)
 	if err := os.MkdirAll(packageDir, 0755); err != nil {
 		fmt.Printf("[-] Failed to create output directory %s: %v\n", packageDir, err)
 		return
@@ -271,11 +281,15 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 }
 
 func outputDirForPid(outDir string, pid uint32) string {
+	return filepath.Join(outDir, sanitizePathComponent(packageNameForPid(pid)))
+}
+
+func packageNameForPid(pid uint32) string {
 	name, err := processPackageName(pid)
 	if err != nil || name == "" {
 		name = fmt.Sprintf("pid_%d", pid)
 	}
-	return filepath.Join(outDir, sanitizePathComponent(name))
+	return name
 }
 
 func processPackageName(pid uint32) (string, error) {
