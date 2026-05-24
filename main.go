@@ -248,7 +248,13 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 		dumpedMu.Unlock()
 	}
 
-	outPath := filepath.Join(outDir, fmt.Sprintf("dump_pid_%d_0x%x_%d_%s.dex", pid, base, readSize, source))
+	packageDir := outputDirForPid(outDir, pid)
+	if err := os.MkdirAll(packageDir, 0755); err != nil {
+		fmt.Printf("[-] Failed to create output directory %s: %v\n", packageDir, err)
+		return
+	}
+
+	outPath := filepath.Join(packageDir, fmt.Sprintf("dump_pid_%d_0x%x_%d_%s.dex", pid, base, readSize, source))
 	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		fmt.Printf("[-] Failed to create %s: %v\n", outPath, err)
@@ -262,6 +268,45 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 	}
 
 	fmt.Printf("[+] Dumped DEX: %s\n", outPath)
+}
+
+func outputDirForPid(outDir string, pid uint32) string {
+	name, err := processPackageName(pid)
+	if err != nil || name == "" {
+		name = fmt.Sprintf("pid_%d", pid)
+	}
+	return filepath.Join(outDir, sanitizePathComponent(name))
+}
+
+func processPackageName(pid uint32) (string, error) {
+	cmdline, err := os.ReadFile(filepath.Join("/proc", strconv.FormatUint(uint64(pid), 10), "cmdline"))
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimRight(string(cmdline), "\x00")
+	if idx := strings.IndexByte(name, '\x00'); idx >= 0 {
+		name = name[:idx]
+	}
+	if idx := strings.IndexByte(name, ':'); idx >= 0 {
+		name = name[:idx]
+	}
+	return name, nil
+}
+
+func sanitizePathComponent(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	clean := strings.Trim(b.String(), "._-")
+	if clean == "" {
+		return "unknown"
+	}
+	return clean
 }
 
 func normalizeDexHeader(buf []byte) bool {
