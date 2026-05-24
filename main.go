@@ -30,7 +30,9 @@ type dexEvent struct {
 func main() {
 	var (
 		bpfObject   = flag.String("obj", "dex_dump.bpf.o", "path to compiled eBPF object")
-		libPath     = flag.String("libart", "/apex/com.android.art/lib64/libart.so", "path to target libart.so")
+		libPath     = flag.String("lib", "/apex/com.android.art/lib64/libdexfile.so", "path to target ART dex library")
+		symbolName  = flag.String("symbol", "", "optional symbol name to uprobe; defaults to known DexFile open symbols")
+		offset      = flag.Uint64("offset", 0, "optional file offset to uprobe; overrides symbol lookup when non-zero")
 		outDir      = flag.String("out", "/data/local/tmp", "directory for dumped DEX files")
 		maxDump     = flag.Uint64("max-dump", 64*1024, "maximum bytes to read from each DEX memory region, 0 means full size")
 		packageName = flag.String("package", "", "optional Android package name filter")
@@ -53,13 +55,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(*bpfObject, *libPath, *outDir, targetPid, *maxDump); err != nil {
+	if err := run(*bpfObject, *libPath, *symbolName, *offset, *outDir, targetPid, *maxDump); err != nil {
 		fmt.Fprintf(os.Stderr, "[-] %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(bpfObject, libPath, outDir string, targetPid uint32, maxDump uint64) error {
+func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, targetPid uint32, maxDump uint64) error {
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
@@ -82,7 +84,7 @@ func run(bpfObject, libPath, outDir string, targetPid uint32, maxDump uint64) er
 		return fmt.Errorf("failed to open %s: %w", libPath, err)
 	}
 
-	ln, symbol, err := attachDexFileCtor(up, objs.UprobeDexOpen)
+	ln, symbol, err := attachDexOpen(up, objs.UprobeDexOpen, symbolName, offset)
 	if err != nil {
 		return err
 	}
@@ -147,10 +149,21 @@ func loadObjects(path string, objs interface{}) error {
 	})
 }
 
-func attachDexFileCtor(ex *link.Executable, prog *ebpf.Program) (link.Link, string, error) {
+func attachDexOpen(ex *link.Executable, prog *ebpf.Program, symbolName string, offset uint64) (link.Link, string, error) {
+	if offset != 0 {
+		ln, err := ex.Uprobe("", prog, &link.UprobeOptions{Address: offset})
+		return ln, fmt.Sprintf("offset:0x%x", offset), err
+	}
+
+	if symbolName != "" {
+		ln, err := ex.Uprobe(symbolName, prog, nil)
+		return ln, symbolName, err
+	}
+
 	symbols := []string{
-		"_ZN3art7DexFileC1EPKhmRKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEEjPKNS_10OatDexFileE",
-		"_ZN3art7DexFileC2EPKhmRKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEEjPKNS_10OatDexFileE",
+		"_ZNK3art16ArtDexFileLoader4OpenEPKhmRKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEEjPKNS_10OatDexFileEbbPS9_NS3_10unique_ptrINS_16DexFileContainerENS3_14default_deleteISH_EEEE",
+		"_ZNK3art13DexFileLoader4OpenEPKhmRKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEEjPKNS_10OatDexFileEbbPS9_NS3_10unique_ptrINS_16DexFileContainerENS3_14default_deleteISH_EEEE",
+		"_ZN3art7DexFileC2EPKhmS2_mRKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEEjPKNS_10OatDexFileENS3_10unique_ptrINS_16DexFileContainerENS3_14default_deleteISG_EEEEb",
 	}
 
 	var lastErr error
@@ -162,7 +175,7 @@ func attachDexFileCtor(ex *link.Executable, prog *ebpf.Program) (link.Link, stri
 		lastErr = err
 	}
 
-	return nil, "", fmt.Errorf("failed to attach DexFile constructor uprobe: %w", lastErr)
+	return nil, "", fmt.Errorf("failed to attach DEX open uprobe: %w", lastErr)
 }
 
 func dumpDex(outDir string, event dexEvent, maxDump uint64) {
