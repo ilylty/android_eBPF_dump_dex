@@ -17,6 +17,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 type dexEvent struct {
@@ -60,6 +61,10 @@ func main() {
 func run(bpfObject, libPath, outDir string, targetPid uint32) error {
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("failed to remove memlock limit: %w", err)
+	}
 
 	spec, err := ebpf.LoadCollectionSpec(bpfObject)
 	if err != nil {
