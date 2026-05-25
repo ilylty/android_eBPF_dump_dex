@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.0.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as prerelease"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as draft"
+        required: false
+        default: false
+        type: boolean
+      release_notes:
+        description: "Additional release notes"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev libbpf-dev build-essential
+
+      - name: Build eBPF
+        run: |
+          mkdir -p dist
+          clang -target bpf \
+            -D__TARGET_ARCH_arm64 \
+            -I/usr/include/x86_64-linux-gnu \
+            -O2 -g -c dex_dump.bpf.c -o dist/dex_dump.bpf.o
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Build loader
+        run: |
+          go mod tidy
+          env CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -ldflags="-s -w" -o dist/dex_dump_bin main.go
+
+      - name: Package artifacts
+        run: |
+          cp run_dexdump_full.sh dist/run_dexdump_full.sh
+          chmod +x dist/run_dexdump_full.sh
+          tar -czf android-ebpf-dex-dumper-${{ inputs.version }}.tar.gz -C dist dex_dump.bpf.o dex_dump_bin run_dexdump_full.sh
+          sha256sum android-ebpf-dex-dumper-${{ inputs.version }}.tar.gz > android-ebpf-dex-dumper-${{ inputs.version }}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ebpf-dex-dumper-release
+          path: |
+            android-ebpf-dex-dumper-${{ inputs.version }}.tar.gz
+            android-ebpf-dex-dumper-${{ inputs.version }}.tar.gz.sha256
+          retention-days: 30
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Release: Tag"
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists locally"
+          elif git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            git fetch --tags origin "refs/tags/v${VERSION}:refs/tags/v${VERSION}"
+          else
+            git tag -a "v${VERSION}" -m "Release v${VERSION}"
+            git push origin "v${VERSION}"
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-ebpf-dex-dumper-release
+          path: dist
+
+      - name: Write notes
+        env:
+          VERSION: ${{ inputs.version }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          cat > release-notes.md <<EOF
+          # Release v${VERSION}
+
+          ## Highlights
+
+          - Android ARM64 eBPF DEX dumper release.
+          - Includes the eBPF bytecode, Android loader, and device-side runner script.
+
+          ## Changes
+
+          ${RELEASE_NOTES}
+
+          ## Usage
+
+          Extract the archive, push the files to the device, then run from a device-side root shell:
+
+          \`\`\`bash
+          adb push dex_dump.bpf.o /data/local/tmp/
+          adb push dex_dump_bin /data/local/tmp/
+          adb push run_dexdump_full.sh /data/local/tmp/
+          adb shell chmod +x /data/local/tmp/dex_dump_bin /data/local/tmp/run_dexdump_full.sh
+          adb shell
+          su
+          cd /data/local/tmp
+          ./run_dexdump_full.sh run
+          \`\`\`
+
+          ## Artifacts
+
+          - \`android-ebpf-dex-dumper-${VERSION}.tar.gz\`
+          - \`android-ebpf-dex-dumper-${VERSION}.tar.gz.sha256\`
+          EOF
+
+      - name: "Release: Create"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Release v${{ inputs.version }}
+          files: dist/*
+          body_path: release-notes.md
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          draft: ${{ inputs.draft }}
