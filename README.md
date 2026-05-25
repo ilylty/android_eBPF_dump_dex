@@ -30,6 +30,8 @@ cd /data/local/tmp
 ./run_dexdump_full.sh run
 ```
 
+After the script is running and waiting for events, open the target protected app and interact with it until its unpacking or DEX loading logic is triggered.
+
 Background mode:
 
 ```bash
