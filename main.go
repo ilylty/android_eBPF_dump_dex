@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +28,96 @@ type dexEvent struct {
 	Size uint64
 	Pid  uint32
 	Comm [16]byte
+}
+
+const (
+	maxDexSize         = 512 * 1024 * 1024
+	dumpBufferSize     = 256 * 1024
+	scanChunkSize      = 1024 * 1024
+	perfReaderPages    = 64
+	dumpQueueSize      = 8192
+	maxConcurrentDumps = 2
+	openNoFollow       = 0x20000
+)
+
+type dumpJob struct {
+	outDir  string
+	pid     uint32
+	base    uint64
+	size    uint64
+	maxDump uint64
+	source  string
+	key     string
+}
+
+type dumpTracker struct {
+	mu         sync.Mutex
+	done       map[string]struct{}
+	inProgress map[string]struct{}
+}
+
+func newDumpTracker() *dumpTracker {
+	return &dumpTracker{
+		done:       make(map[string]struct{}),
+		inProgress: make(map[string]struct{}),
+	}
+}
+
+func (t *dumpTracker) begin(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.done[key]; ok {
+		return false
+	}
+	if _, ok := t.inProgress[key]; ok {
+		return false
+	}
+	t.inProgress[key] = struct{}{}
+	return true
+}
+
+func (t *dumpTracker) finish(key string, success bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.inProgress, key)
+	if success {
+		t.done[key] = struct{}{}
+	}
+}
+
+type scanTracker struct {
+	mu      sync.Mutex
+	running map[uint32]struct{}
+	pending map[uint32]struct{}
+}
+
+func newScanTracker() *scanTracker {
+	return &scanTracker{
+		running: make(map[uint32]struct{}),
+		pending: make(map[uint32]struct{}),
+	}
+}
+
+func (t *scanTracker) request(pid uint32) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.running[pid]; ok {
+		t.pending[pid] = struct{}{}
+		return false
+	}
+	t.running[pid] = struct{}{}
+	return true
+}
+
+func (t *scanTracker) finish(pid uint32) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.pending[pid]; ok {
+		delete(t.pending, pid)
+		return true
+	}
+	delete(t.running, pid)
+	return false
 }
 
 func main() {
@@ -53,8 +144,12 @@ func main() {
 		fmt.Printf("[+] Filtering target package %s, pid=%d\n", *packageName, targetPid)
 	}
 
-	if err := os.MkdirAll(*outDir, 0755); err != nil {
+	if err := os.MkdirAll(*outDir, 0700); err != nil {
 		fmt.Fprintf(os.Stderr, "[-] Failed to create output directory: %v\n", err)
+		os.Exit(1)
+	}
+	if err := ensureSafeDir(*outDir); err != nil {
+		fmt.Fprintf(os.Stderr, "[-] Unsafe output directory: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -67,6 +162,7 @@ func main() {
 func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, targetPid uint32, maxDump uint64, scanHeaders bool) error {
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stopper)
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		fmt.Printf("[-] Failed to remove memlock limit, continuing: %v\n", err)
@@ -93,7 +189,7 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 	}
 	defer ln.Close()
 
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize())
+	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*perfReaderPages)
 	if err != nil {
 		return fmt.Errorf("failed to create perf event reader: %w", err)
 	}
@@ -107,11 +203,14 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 		rd.Close()
 	}()
 
-	seen := make(map[string]struct{})
-	dumped := make(map[string]struct{})
-	var dumpedMu sync.Mutex
+	dumps := newDumpTracker()
+	scans := newScanTracker()
+	dumpQueue := make(chan dumpJob, dumpQueueSize)
+	for i := 0; i < maxConcurrentDumps; i++ {
+		go dumpWorker(dumpQueue, dumps)
+	}
 	if scanHeaders && targetPid != 0 {
-		go scanDexHeaders(outDir, targetPid, maxDump, dumped, &dumpedMu)
+		startScan(outDir, targetPid, maxDump, dumps, scans, dumpQueue)
 	}
 
 	for {
@@ -122,10 +221,14 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 			}
 			return fmt.Errorf("failed to read perf event: %w", err)
 		}
+		if record.LostSamples > 0 {
+			fmt.Printf("[-] Lost %d perf samples; increase buffer or reduce scan/dump load\n", record.LostSamples)
+			continue
+		}
 
 		var event dexEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			fmt.Printf("[-] Failed to parse ringbuf sample: %v\n", err)
+			fmt.Printf("[-] Failed to parse perf sample: %v\n", err)
 			continue
 		}
 
@@ -133,17 +236,11 @@ func run(bpfObject, libPath, symbolName string, offset uint64, outDir string, ta
 			continue
 		}
 
-		key := fmt.Sprintf("%d:%x:%x", event.Pid, event.Base, event.Size)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-
 		comm := string(bytes.TrimRight(event.Comm[:], "\x00"))
 		fmt.Printf("[*] DEX pid=%d comm=%s base=0x%x size=%d\n", event.Pid, comm, event.Base, event.Size)
-		go dumpDex(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumped, &dumpedMu)
+		enqueueDump(outDir, event.Pid, event.Base, event.Size, maxDump, "event", dumps, dumpQueue)
 		if scanHeaders {
-			go scanDexHeaders(outDir, event.Pid, maxDump, dumped, &dumpedMu)
+			startScan(outDir, event.Pid, maxDump, dumps, scans, dumpQueue)
 		}
 	}
 }
@@ -190,20 +287,48 @@ func attachDexOpen(ex *link.Executable, prog *ebpf.Program, symbolName string, o
 	return nil, "", fmt.Errorf("failed to attach DEX open uprobe: %w", lastErr)
 }
 
-func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64, source string, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
-	if size < 0x70 || size > 512*1024*1024 {
+func dumpWorker(queue <-chan dumpJob, dumps *dumpTracker) {
+	for job := range queue {
+		dumpDex(job.outDir, job.pid, job.base, job.size, job.maxDump, job.source, job.key, dumps)
+	}
+}
+
+func enqueueDump(outDir string, pid uint32, base uint64, size uint64, maxDump uint64, source string, dumps *dumpTracker, queue chan<- dumpJob) {
+	key := dumpKey(pid, base, size)
+	if !dumps.begin(key) {
+		return
+	}
+	queue <- dumpJob{outDir: outDir, pid: pid, base: base, size: size, maxDump: maxDump, source: source, key: key}
+}
+
+func dumpKey(pid uint32, base uint64, size uint64) string {
+	return fmt.Sprintf("%d:%x:%x", pid, base, size)
+}
+
+func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64, source string, key string, dumps *dumpTracker) {
+	success := false
+	defer func() { dumps.finish(key, success) }()
+
+	if size < 0x70 || size > maxDexSize {
 		fmt.Printf("[-] Skip invalid DEX size pid=%d base=0x%x size=%d source=%s\n", pid, base, size, source)
 		return
 	}
-
-	dumpedMu.Lock()
-	key := fmt.Sprintf("%d:%x:%x", pid, base, size)
-	if _, ok := dumped[key]; ok {
-		dumpedMu.Unlock()
+	readSize := size
+	if maxDump > 0 && readSize > maxDump {
+		readSize = maxDump
+	}
+	if readSize < 0x70 {
+		fmt.Printf("[-] Skip too-small DEX read pid=%d base=0x%x readSize=%d source=%s\n", pid, base, readSize, source)
 		return
 	}
-	dumped[key] = struct{}{}
-	dumpedMu.Unlock()
+	if base > math.MaxInt64 {
+		fmt.Printf("[-] Skip DEX with unsupported base pid=%d base=0x%x source=%s\n", pid, base, source)
+		return
+	}
+	if readSize > uint64(math.MaxInt64)-base {
+		fmt.Printf("[-] Skip DEX with overflowing range pid=%d base=0x%x readSize=%d source=%s\n", pid, base, readSize, source)
+		return
+	}
 
 	memPath := fmt.Sprintf("/proc/%d/mem", pid)
 	memFile, err := os.Open(memPath)
@@ -213,51 +338,118 @@ func dumpDex(outDir string, pid uint32, base uint64, size uint64, maxDump uint64
 	}
 	defer memFile.Close()
 
-	if _, err := memFile.Seek(int64(base), io.SeekStart); err != nil {
-		fmt.Printf("[-] Failed to seek %s to 0x%x: %v\n", memPath, base, err)
+	header := make([]byte, 0x70)
+	if _, err := memFile.ReadAt(header, int64(base)); err != nil {
+		fmt.Printf("[-] Failed to read DEX header for pid=%d base=0x%x source=%s: %v\n", pid, base, source, err)
 		return
 	}
 
-	readSize := size
-	if maxDump > 0 && readSize > maxDump {
-		readSize = maxDump
-	}
-
-	buf := make([]byte, readSize)
-	if _, err := io.ReadFull(memFile, buf); err != nil {
-		fmt.Printf("[-] Failed to read DEX memory for pid=%d base=0x%x source=%s: %v\n", pid, base, source, err)
-		return
-	}
-
-	if !normalizeDexHeader(buf) {
+	if !normalizeDexHeader(header) {
 		fmt.Printf("[-] Skip non-DEX memory pid=%d base=0x%x source=%s\n", pid, base, source)
 		return
 	}
+
 	packageName := packageNameForPid(pid)
 	packageDir := filepath.Join(outDir, sanitizePathComponent(packageName))
-	if err := os.MkdirAll(packageDir, 0755); err != nil {
+	if err := os.MkdirAll(packageDir, 0700); err != nil {
 		fmt.Printf("[-] Failed to create output directory %s: %v\n", packageDir, err)
 		return
 	}
-
-	outPath := filepath.Join(packageDir, fmt.Sprintf("dump_pid_%d_0x%x_%d_%s.dex", pid, base, readSize, source))
-	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		fmt.Printf("[-] Failed to create %s: %v\n", outPath, err)
+	if err := ensureSafeDir(packageDir); err != nil {
+		fmt.Printf("[-] Unsafe output directory %s: %v\n", packageDir, err)
 		return
 	}
-	defer outFile.Close()
 
-	if _, err := outFile.Write(buf); err != nil {
+	outPath, outFile, err := createDumpFile(packageDir, pid, base, readSize, source)
+	if err != nil {
+		fmt.Printf("[-] Failed to create dump file in %s: %v\n", packageDir, err)
+		return
+	}
+	removeIncomplete := true
+	defer func() {
+		outFile.Close()
+		if removeIncomplete {
+			os.Remove(outPath)
+		}
+	}()
+
+	written, err := writeDexStream(memFile, outFile, base, readSize, header)
+	if err != nil {
 		fmt.Printf("[-] Failed to write %s: %v\n", outPath, err)
 		return
 	}
+	if written != readSize {
+		fmt.Printf("[-] Short DEX dump %s: wrote=%d expected=%d\n", outPath, written, readSize)
+		return
+	}
 
+	removeIncomplete = false
+	success = true
 	fmt.Printf("[+] Dumped DEX: %s\n", outPath)
 }
 
-func outputDirForPid(outDir string, pid uint32) string {
-	return filepath.Join(outDir, sanitizePathComponent(packageNameForPid(pid)))
+func createDumpFile(packageDir string, pid uint32, base uint64, readSize uint64, source string) (string, *os.File, error) {
+	baseName := fmt.Sprintf("dump_pid_%d_0x%x_%d_%s", pid, base, readSize, source)
+	for i := 0; i < 1000; i++ {
+		name := baseName + ".dex"
+		if i > 0 {
+			name = fmt.Sprintf("%s_%d.dex", baseName, i)
+		}
+		path := filepath.Join(packageDir, name)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|openNoFollow, 0644)
+		if err == nil {
+			return path, file, nil
+		}
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return "", nil, err
+	}
+	return "", nil, fmt.Errorf("too many existing dump files for %s", baseName)
+}
+
+func ensureSafeDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink directory")
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("not a directory")
+	}
+	return nil
+}
+
+func writeDexStream(memFile, outFile *os.File, base uint64, readSize uint64, header []byte) (uint64, error) {
+	firstWrite := uint64(len(header))
+	if firstWrite > readSize {
+		firstWrite = readSize
+	}
+	if _, err := outFile.Write(header[:firstWrite]); err != nil {
+		return 0, err
+	}
+	written := firstWrite
+	buf := make([]byte, dumpBufferSize)
+	for written < readSize {
+		want := uint64(len(buf))
+		remaining := readSize - written
+		if want > remaining {
+			want = remaining
+		}
+		n, err := memFile.ReadAt(buf[:want], int64(base+written))
+		if n > 0 {
+			if _, writeErr := outFile.Write(buf[:n]); writeErr != nil {
+				return written, writeErr
+			}
+			written += uint64(n)
+		}
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 func packageNameForPid(pid uint32) string {
@@ -316,7 +508,21 @@ func normalizeDexHeader(buf []byte) bool {
 	return false
 }
 
-func scanDexHeaders(outDir string, pid uint32, maxDump uint64, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
+func startScan(outDir string, pid uint32, maxDump uint64, dumps *dumpTracker, scans *scanTracker, dumpQueue chan<- dumpJob) {
+	if !scans.request(pid) {
+		return
+	}
+	go func() {
+		for {
+			scanDexHeaders(outDir, pid, maxDump, dumps, dumpQueue)
+			if !scans.finish(pid) {
+				return
+			}
+		}
+	}()
+}
+
+func scanDexHeaders(outDir string, pid uint32, maxDump uint64, dumps *dumpTracker, dumpQueue chan<- dumpJob) {
 	ranges, err := readableRanges(pid)
 	if err != nil {
 		fmt.Printf("[-] Failed to read maps for pid=%d: %v\n", pid, err)
@@ -332,17 +538,19 @@ func scanDexHeaders(outDir string, pid uint32, maxDump uint64, dumped map[string
 	defer memFile.Close()
 
 	pattern := []byte{0x70, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00}
-	const chunkSize = 1024 * 1024
+	buf := make([]byte, scanChunkSize)
 	for _, r := range ranges {
 		for pos := r.start; pos < r.end; {
-			end := pos + chunkSize
+			end := pos + scanChunkSize
 			if end > r.end {
 				end = r.end
 			}
-			buf := make([]byte, end-pos)
-			n, err := memFile.ReadAt(buf, int64(pos))
+			if pos > math.MaxInt64 {
+				break
+			}
+			n, err := memFile.ReadAt(buf[:end-pos], int64(pos))
 			if n > 0 {
-				scanChunk(outDir, pid, memFile, pos, buf[:n], pattern, maxDump, dumped, dumpedMu)
+				scanChunk(outDir, pid, memFile, pos, buf[:n], pattern, maxDump, dumps, dumpQueue)
 			}
 			if err != nil && !errors.Is(err, io.EOF) {
 				break
@@ -355,7 +563,7 @@ func scanDexHeaders(outDir string, pid uint32, maxDump uint64, dumped map[string
 	}
 }
 
-func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, buf []byte, pattern []byte, maxDump uint64, dumped map[string]struct{}, dumpedMu *sync.Mutex) {
+func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, buf []byte, pattern []byte, maxDump uint64, dumps *dumpTracker, dumpQueue chan<- dumpJob) {
 	for off := 0; ; {
 		idx := bytes.Index(buf[off:], pattern)
 		if idx < 0 {
@@ -367,7 +575,7 @@ func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, bu
 			size, ok := readDexFileSize(memFile, base)
 			if ok {
 				fmt.Printf("[*] Scanned DEX pid=%d base=0x%x size=%d\n", pid, base, size)
-				dumpDex(outDir, pid, base, size, maxDump, "scan", dumped, dumpedMu)
+				enqueueDump(outDir, pid, base, size, maxDump, "scan", dumps, dumpQueue)
 			}
 		}
 		off += idx + 1
@@ -375,6 +583,9 @@ func scanChunk(outDir string, pid uint32, memFile *os.File, chunkBase uint64, bu
 }
 
 func readDexFileSize(memFile *os.File, base uint64) (uint64, bool) {
+	if base > math.MaxInt64 {
+		return 0, false
+	}
 	header := make([]byte, 0x40)
 	if _, err := memFile.ReadAt(header, int64(base)); err != nil {
 		return 0, false
@@ -386,7 +597,7 @@ func readDexFileSize(memFile *os.File, base uint64) (uint64, bool) {
 		return 0, false
 	}
 	size := uint64(binary.LittleEndian.Uint32(header[0x20:0x24]))
-	return size, size >= 0x70 && size <= 512*1024*1024
+	return size, size >= 0x70 && size <= maxDexSize
 }
 
 type memRange struct {
