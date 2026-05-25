@@ -41,8 +41,6 @@ cd /data/local/tmp
 
 The script automatically:
 
-- switches SELinux to permissive if allowed
-- mounts `tracefs` or `debugfs`
 - checks `dex_dump_bin` and `dex_dump.bpf.o`
 - writes diagnostics to `dexdump.log`
 - cleans old `dump_pid_*.dex` files
@@ -99,8 +97,6 @@ Basic run:
 ```bash
 adb shell
 su
-setenforce 0
-mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || mount -t debugfs nodev /sys/kernel/debug
 cd /data/local/tmp
 ./dex_dump_bin -lib /apex/com.android.art/lib64/libdexfile.so -package com.example.target -max-dump 65536
 ```
@@ -143,8 +139,6 @@ If eBPF loading fails from ADB root, create and run a device-side script from a 
 
 ```bash
 cd /data/local/tmp
-setenforce 0 2>/dev/null || true
-mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || mount -t debugfs nodev /sys/kernel/debug 2>/dev/null || true
 ./dex_dump_bin -lib /apex/com.android.art/lib64/libdexfile.so -package com.example.target -scan -max-dump 65536
 ```
 

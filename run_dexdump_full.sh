@@ -61,9 +61,6 @@ prepare_env() {
   cd "$WORKDIR"
   [ -x "$BIN" ] || { echo "missing executable: $BIN" >&2; exit 1; }
   [ -f "$OBJ" ] || { echo "missing eBPF object: $OBJ" >&2; exit 1; }
-
-  setenforce 0 2>/dev/null || true
-  mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || mount -t debugfs nodev /sys/kernel/debug 2>/dev/null || true
 }
 
 write_diag() {
